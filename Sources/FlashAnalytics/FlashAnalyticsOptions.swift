@@ -13,6 +13,22 @@ public struct CaptureVariantsOptions: Sendable {
     }
 }
 
+public struct LocalSdkEventRule: Sendable {
+    public let name: String
+    public let allowProperties: [String]
+    public let blockProperties: [String]
+
+    public init(
+        name: String,
+        allowProperties: [String] = [],
+        blockProperties: [String] = []
+    ) {
+        self.name = name
+        self.allowProperties = allowProperties
+        self.blockProperties = blockProperties
+    }
+}
+
 public struct FlashAnalyticsOptions {
     public let appId: String
     public let secretKey: String?
@@ -29,6 +45,7 @@ public struct FlashAnalyticsOptions {
     public let buildNumber: String?
     public let language: String?
     public let country: String?
+    public let maxSessionTimeoutInMin: Int?
     public let captureScreenViews: Bool
     public let captureAppLifecycle: Bool
     public let captureDeepLinks: Bool
@@ -43,6 +60,10 @@ public struct FlashAnalyticsOptions {
     /// Equivalent to `captureNativeCrashes` — use either flag.
     public let captureErrors: Bool
     public let captureVariants: CaptureVariantsOptions?
+    public let collectionConfig: Bool
+    public let allowEvents: [LocalSdkEventRule]
+    public let blockEvents: [String]
+    public let blockProperties: [String]
     public let shouldTrack: ((TrackHandlerPayload) -> Bool)?
     public let shouldCaptureRequest: ((URL, TrackHandlerPayload) -> Bool)?
     /// Called whenever the SDK receives, refreshes, or restores the current session ID.
@@ -73,6 +94,7 @@ public struct FlashAnalyticsOptions {
         buildNumber: String? = nil,
         language: String? = nil,
         country: String? = nil,
+        maxSessionTimeoutInMin: Int? = nil,
         captureScreenViews: Bool = false,
         captureAppLifecycle: Bool = false,
         captureDeepLinks: Bool = false,
@@ -81,6 +103,10 @@ public struct FlashAnalyticsOptions {
         capturePushLifecycle: Bool = false,
         captureViewInteractions: Bool = false,
         captureVariants: CaptureVariantsOptions? = nil,
+        collectionConfig: Bool = true,
+        allowEvents: [LocalSdkEventRule] = [],
+        blockEvents: [String] = [],
+        blockProperties: [String] = [],
         captureNativeCrashes: Bool = false,
         captureErrors: Bool = false,
         shouldTrack: ((TrackHandlerPayload) -> Bool)? = nil,
@@ -106,6 +132,7 @@ public struct FlashAnalyticsOptions {
         self.buildNumber = buildNumber
         self.language = language
         self.country = country
+        self.maxSessionTimeoutInMin = maxSessionTimeoutInMin
         self.captureScreenViews = captureScreenViews
         self.captureAppLifecycle = captureAppLifecycle
         self.captureDeepLinks = captureDeepLinks
@@ -114,6 +141,10 @@ public struct FlashAnalyticsOptions {
         self.capturePushLifecycle = capturePushLifecycle
         self.captureViewInteractions = captureViewInteractions
         self.captureVariants = captureVariants
+        self.collectionConfig = collectionConfig
+        self.allowEvents = allowEvents
+        self.blockEvents = blockEvents
+        self.blockProperties = blockProperties
         self.captureNativeCrashes = captureNativeCrashes
         self.captureErrors = captureErrors
         self.shouldTrack = shouldTrack
@@ -125,4 +156,4 @@ public struct FlashAnalyticsOptions {
     }
 }
 
-public let SDK_VERSION = "1.1.4"
+public let SDK_VERSION = "1.1.5"

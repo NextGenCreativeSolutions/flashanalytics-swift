@@ -478,6 +478,7 @@ struct TrackResponse: Codable, Sendable {
 
 struct TrackBatchResponse: Decodable, Sendable {
     let sessionId: String?
+    let estimatedSessionTtlMs: Int?
     let estimatedSessionExpiresAt: Int?
     let results: [TrackResponse]?
 }

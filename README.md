@@ -19,13 +19,13 @@ For local development in this monorepo, add the package from disk:
 For published releases, SwiftPM requires the package manifest to live at the root of the Git repo or package registry entry. This SDK currently lives inside the monorepo at `packages/sdks/swift`, so publish it as a standalone repo history first, then depend on that repo:
 
 ```swift
-.package(url: "https://github.com/NextGenCreativeSolutions/flashanalytics-swift.git", from: "1.1.4")
+.package(url: "https://github.com/NextGenCreativeSolutions/flashanalytics-swift.git", from: "1.1.5")
 ```
 
 You can create that standalone package history from this repo with:
 
 ```bash
-./sh/publish-swift-sdk 1.1.4 git@github.com:your-org/flashanalytics-swift.git
+./sh/publish-swift-sdk 1.1.5 git@github.com:your-org/flashanalytics-swift.git
 ```
 
 The script uses `git subtree split` to publish only `packages/sdks/swift` to the target remote.
@@ -40,6 +40,7 @@ let analytics = FlashAnalytics.configureShared(
         appId: "your-app-id",
         secretKey: "sec_xxx",
         endpoint: "https://qa-api.flashanalytics.app",
+        maxSessionTimeoutInMin: 3,
         captureAppLifecycle: true,
         captureDeepLinks: true,
         captureScreenViews: true,
@@ -56,6 +57,32 @@ analytics.identify(
 
 analytics.track("signup_clicked", properties: ["plan": "pro"])
 ```
+
+## SDK-local event rules and session timeout
+
+```swift
+let analytics = FlashAnalytics(
+    options: FlashAnalyticsOptions(
+        appId: "your-app-id",
+        maxSessionTimeoutInMin: 3,
+        allowEvents: [
+            LocalSdkEventRule(
+                name: "purchase",
+                allowProperties: ["amount", "products.*.sku"],
+                blockProperties: ["email"]
+            )
+        ],
+        blockEvents: ["debug.*"],
+        blockProperties: ["internalDebug"]
+    )
+)
+```
+
+Developer rules run before admin `/sdk-config` rules. `allowEvents` activates local whitelist mode when non-empty, while `blockEvents` drops matching events locally.
+
+Property paths support `products.*.sku` for every array item and `products.0.sku` for only index `0`.
+
+`maxSessionTimeoutInMin` controls local session expiry and heartbeat timing, is sent to the backend, and is cached per client.
 
 ## Experiment Auto-Assignment
 

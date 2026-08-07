@@ -12,7 +12,8 @@ struct FlashAnalyticsTests {
                 endpoint: "https://example.com",
                 captureScreenViews: false,
                 captureAppLifecycle: false,
-                captureSessionOnInit: false
+                captureSessionOnInit: false,
+                collectionConfig: false
             ),
             session: makeSession(recorder: recorder),
             userDefaults: makeUserDefaults()
@@ -25,6 +26,80 @@ struct FlashAnalyticsTests {
         #expect(recorder.count() == 1)
     }
 
+    @Test func trackSendsSdkSessionTimeoutOverride() async throws {
+        let recorder = RequestRecorder()
+        let analytics = FlashAnalytics(
+            options: FlashAnalyticsOptions(
+                appId: "11111111-1111-4111-8111-111111111111",
+                endpoint: "https://example.com",
+                maxSessionTimeoutInMin: 3,
+                captureAppLifecycle: false,
+                captureSessionOnInit: false,
+                collectionConfig: false
+            ),
+            session: makeSession(recorder: recorder),
+            userDefaults: makeUserDefaults()
+        )
+
+        analytics.track("page_view")
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let body = recorder.body(at: 0) ?? ""
+        #expect(body.contains(#""__maxSessionTimeoutInMin":3"#))
+    }
+
+    @Test func heartbeatBypassesUserTrackingCallbacks() async throws {
+        let recorder = RequestRecorder()
+        let analytics = FlashAnalytics(
+            options: FlashAnalyticsOptions(
+                appId: "11111111-1111-4111-8111-111111111111",
+                endpoint: "https://example.com",
+                captureAppLifecycle: false,
+                captureSessionOnInit: false,
+                collectionConfig: false,
+                shouldTrack: { _ in false },
+                shouldCaptureRequest: { _, _ in false }
+            ),
+            session: makeSession(recorder: recorder),
+            userDefaults: makeUserDefaults()
+        )
+
+        analytics.track("sdk_heartbeat")
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let body = recorder.body(at: 0) ?? ""
+        #expect(body.contains(#""name":"sdk_heartbeat""#))
+    }
+
+    @Test func scheduledBatchFlushSendsQueuedEvents() async throws {
+        let recorder = RequestRecorder()
+        let analytics = FlashAnalytics(
+            options: FlashAnalyticsOptions(
+                appId: "11111111-1111-4111-8111-111111111111",
+                endpoint: "https://example.com",
+                captureAppLifecycle: false,
+                captureSessionOnInit: false,
+                collectionConfig: false,
+                batchEnable: true,
+                batchSize: 10,
+                batchTimeoutMs: 50
+            ),
+            session: makeSession(
+                recorder: recorder,
+                responseBody: #"{"sessionId":"22222222-2222-4222-8222-222222222222"}"#
+            ),
+            userDefaults: makeUserDefaults()
+        )
+
+        analytics.track("batched_event", properties: ["source": "scheduled-flush"])
+        await waitUntil { recorder.count() == 1 }
+
+        let body = recorder.body(at: 0) ?? ""
+        #expect(body.contains(#""batch""#))
+        #expect(body.contains(#""name":"batched_event""#))
+        #expect(body.contains(#""source":"scheduled-flush""#))
+    }
+
     @Test func deferUntilIdentifyFlushesQueuedEvents() async throws {
         let recorder = RequestRecorder()
         let analytics = FlashAnalytics(
@@ -33,7 +108,8 @@ struct FlashAnalyticsTests {
                 endpoint: "https://example.com",
                 deferUntilIdentify: true,
                 captureAppLifecycle: false,
-                captureSessionOnInit: false
+                captureSessionOnInit: false,
+                collectionConfig: false
             ),
             session: makeSession(recorder: recorder),
             userDefaults: makeUserDefaults()
@@ -56,7 +132,8 @@ struct FlashAnalyticsTests {
                 appId: "11111111-1111-4111-8111-111111111111",
                 endpoint: "https://example.com",
                 deferUntilIdentify: true,
-                captureAppLifecycle: true
+                captureAppLifecycle: true,
+                collectionConfig: false
             ),
             session: makeSession(recorder: recorder),
             userDefaults: makeUserDefaults()
@@ -81,7 +158,8 @@ struct FlashAnalyticsTests {
                 endpoint: "https://example.com",
                 deferUntilIdentify: true,
                 captureAppLifecycle: false,
-                captureSessionOnInit: false
+                captureSessionOnInit: false,
+                collectionConfig: false
             ),
             session: makeSession(recorder: recorder),
             userDefaults: makeUserDefaults()
@@ -103,6 +181,87 @@ struct FlashAnalyticsTests {
         #expect(recorder.count() == 2)
     }
 
+    @Test func developerSdkRulesWhitelistEventsAndStripProperties() async throws {
+        let recorder = RequestRecorder()
+        let analytics = FlashAnalytics(
+            options: FlashAnalyticsOptions(
+                appId: "11111111-1111-4111-8111-111111111111",
+                endpoint: "https://example.com",
+                captureAppLifecycle: false,
+                captureSessionOnInit: false,
+                collectionConfig: false,
+                allowEvents: [
+                    LocalSdkEventRule(
+                        name: "purchase",
+                        allowProperties: ["amount", "products.0.sku"],
+                        blockProperties: ["email"]
+                    )
+                ],
+                blockProperties: ["debug"]
+            ),
+            session: makeSession(recorder: recorder),
+            userDefaults: makeUserDefaults()
+        )
+
+        analytics.track(
+            "purchase",
+            properties: [
+                "amount": 20,
+                "email": "a@b.c",
+                "debug": true,
+                "__sessionId": "s1",
+                "products": [
+                    ["sku": "A1", "price": 100],
+                    ["sku": "B2", "price": 200]
+                ]
+            ]
+        )
+        analytics.track("signup", properties: ["email": "a@b.c"])
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        #expect(recorder.count() == 1)
+        let body = recorder.body(at: 0) ?? ""
+        #expect(body.contains(#""name":"purchase""#))
+        #expect(body.contains(#""amount":20"#))
+        #expect(body.contains(#""__sessionId":"s1""#))
+        #expect(body.contains(#""sku":"A1""#))
+        #expect(!body.contains(#""sku":"B2""#))
+        #expect(!body.contains(#""price""#))
+        #expect(!body.contains("a@b.c"))
+        #expect(!body.contains(#""debug""#))
+    }
+
+    @Test func developerSdkBlockPropertiesRemovesTerminalArrayIndexPaths() async throws {
+        let recorder = RequestRecorder()
+        let analytics = FlashAnalytics(
+            options: FlashAnalyticsOptions(
+                appId: "11111111-1111-4111-8111-111111111111",
+                endpoint: "https://example.com",
+                captureAppLifecycle: false,
+                captureSessionOnInit: false,
+                collectionConfig: false,
+                blockProperties: ["products.0"]
+            ),
+            session: makeSession(recorder: recorder),
+            userDefaults: makeUserDefaults()
+        )
+
+        analytics.track(
+            "purchase",
+            properties: [
+                "products": [
+                    ["sku": "A1", "price": 100],
+                    ["sku": "B2", "price": 200]
+                ]
+            ]
+        )
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let body = recorder.body(at: 0) ?? ""
+        #expect(!body.contains(#""sku":"A1""#))
+        #expect(body.contains(#""sku":"B2""#))
+    }
+
     @Test func assignExperimentBlockedByShouldCaptureRequest() async throws {
         let recorder = RequestRecorder()
         let analytics = FlashAnalytics(
@@ -111,6 +270,7 @@ struct FlashAnalyticsTests {
                 endpoint: "https://example.com",
                 captureAppLifecycle: false,
                 captureSessionOnInit: false,
+                collectionConfig: false,
                 shouldCaptureRequest: { url, _ in !url.path.contains("/experiments/assign") }
             ),
             session: makeSession(recorder: recorder),
@@ -130,6 +290,7 @@ struct FlashAnalyticsTests {
                 endpoint: "https://example.com",
                 captureAppLifecycle: false,
                 captureSessionOnInit: false,
+                collectionConfig: false,
                 shouldCaptureRequest: { _, _ in true }
             ),
             session: makeSession(recorder: recorder),
@@ -166,6 +327,7 @@ struct FlashAnalyticsTests {
                 endpoint: "https://example.com",
                 captureAppLifecycle: false,
                 captureSessionOnInit: false,
+                collectionConfig: false,
                 onSessionUpdated: { callbackSession = $0 }
             ),
             session: makeSession(
@@ -195,7 +357,8 @@ struct FlashAnalyticsTests {
                 appId: "11111111-1111-4111-8111-111111111111",
                 endpoint: "https://example.com",
                 captureAppLifecycle: false,
-                captureSessionOnInit: false
+                captureSessionOnInit: false,
+                collectionConfig: false
             ),
             session: makeSession(
                 recorder: recorder,
@@ -227,7 +390,8 @@ struct FlashAnalyticsTests {
                 appId: "11111111-1111-4111-8111-111111111111",
                 endpoint: "https://example.com",
                 captureAppLifecycle: false,
-                captureSessionOnInit: false
+                captureSessionOnInit: false,
+                collectionConfig: false
             ),
             session: makeSession(
                 recorder: recorder,
@@ -252,7 +416,8 @@ struct FlashAnalyticsTests {
                 appId: "11111111-1111-4111-8111-111111111111",
                 endpoint: "https://example.com",
                 captureAppLifecycle: false,
-                captureSessionOnInit: false
+                captureSessionOnInit: false,
+                collectionConfig: false
             ),
             session: makeSession(
                 recorder: recorder,
@@ -278,7 +443,8 @@ struct FlashAnalyticsTests {
                 endpoint: "https://example.com",
                 captureAppLifecycle: false,
                 captureSessionOnInit: false,
-                capturePushLifecycle: true
+                capturePushLifecycle: true,
+                collectionConfig: false
             ),
             session: makeSession(recorder: recorder),
             userDefaults: makeUserDefaults()
@@ -319,6 +485,165 @@ struct FlashAnalyticsTests {
         #expect(payload?.messageId == "msg-123")
         #expect(payload?.provider == "firebase")
         #expect(payload?.properties["custom"] as? String == "value")
+    }
+
+    @Test func sdkConfigAllowRuleStripsBlockedEventProperties() async throws {
+        let recorder = RequestRecorder()
+        let analytics = FlashAnalytics(
+            options: FlashAnalyticsOptions(
+                appId: "11111111-1111-4111-8111-111111111111",
+                endpoint: "https://example.com",
+                captureAppLifecycle: false,
+                captureSessionOnInit: false
+            ),
+            session: makeSession(
+                recorder: recorder,
+                responseBodySequence: [
+                    #"""
+                    {"version":"1","ttlSec":60,"collection":{"enabled":true,"blockedProperties":[],"rules":[{"eventName":"purchase","action":"allow","clientIds":[],"enabled":true,"allowedProperties":[],"blockedProperties":["email"],"filters":[]}]}}
+                    """#,
+                    #"{}"#
+                ]
+            ),
+            userDefaults: makeUserDefaults()
+        )
+
+        await waitUntil { recorder.count() >= 1 }
+        analytics.track("purchase", properties: ["email": "buyer@example.com", "amount": 99])
+        await waitUntil { recorder.count() >= 2 }
+
+        let body = recorder.body(at: 1) ?? ""
+        #expect(body.contains(#""name":"purchase""#))
+        #expect(body.contains(#""amount":99"#))
+        #expect(!body.contains("buyer@example.com"))
+    }
+
+    @Test func clientScopedWhitelistDoesNotAffectOtherClients() async throws {
+        let recorder = RequestRecorder()
+        let analytics = FlashAnalytics(
+            options: FlashAnalyticsOptions(
+                appId: "11111111-1111-4111-8111-111111111111",
+                endpoint: "https://example.com",
+                captureAppLifecycle: false,
+                captureSessionOnInit: false
+            ),
+            session: makeSession(
+                recorder: recorder,
+                responseBodySequence: [
+                    #"""
+                    {"version":"1","ttlSec":60,"collection":{"enabled":true,"blockedProperties":[],"rules":[{"eventName":"purchase","action":"allow","clientIds":["22222222-2222-4222-8222-222222222222"],"enabled":true,"allowedProperties":[],"blockedProperties":[],"filters":[]}]}}
+                    """#,
+                    #"{}"#
+                ]
+            ),
+            userDefaults: makeUserDefaults()
+        )
+
+        await waitUntil { recorder.count() >= 1 }
+        analytics.track("signup_clicked")
+        await waitUntil { recorder.count() >= 2 }
+
+        let body = recorder.body(at: 1) ?? ""
+        #expect(body.contains(#""name":"signup_clicked""#))
+    }
+
+    @Test func sdkInitializedEventIgnoresWhitelistRules() async throws {
+        let recorder = RequestRecorder()
+        _ = FlashAnalytics(
+            options: FlashAnalyticsOptions(
+                appId: "11111111-1111-4111-8111-111111111111",
+                endpoint: "https://example.com",
+                captureAppLifecycle: false,
+                captureSessionOnInit: true
+            ),
+            session: makeSession(
+                recorder: recorder,
+                responseBodySequence: [
+                    #"""
+                    {"version":"1","ttlSec":60,"collection":{"enabled":true,"blockedProperties":[],"rules":[{"eventName":"purchase","action":"allow","clientIds":[],"enabled":true,"allowedProperties":[],"blockedProperties":[],"filters":[]}]}}
+                    """#,
+                    #"{}"#
+                ]
+            ),
+            userDefaults: makeUserDefaults()
+        )
+
+        await waitUntil { recorder.count() >= 2 }
+
+        let bodies = (0..<recorder.count()).compactMap { recorder.body(at: $0) }
+        #expect(bodies.contains { $0.contains(#""name":"sdk_initialized""#) })
+    }
+
+    @Test func malformedContainsFilterFailsOpen() {
+        let decision = resolveSdkCollection(
+            config: SdkCollectionConfig(
+                enabled: true,
+                blockedProperties: [],
+                rules: [
+                    SdkEventRuleConfig(
+                        eventName: "purchase",
+                        action: .transform,
+                        clientIds: [],
+                        enabled: true,
+                        allowedProperties: [],
+                        blockedProperties: [],
+                        filters: [
+                            SdkEventFilter(
+                                type: "event_property",
+                                operator: "contains",
+                                value: nil,
+                                propertyName: "email"
+                            )
+                        ]
+                    )
+                ],
+                events: nil
+            ),
+            eventName: "purchase",
+            clientId: "11111111-1111-4111-8111-111111111111",
+            properties: ["email": "buyer@example.com"],
+            context: RemoteConfigContext()
+        )
+
+        if case .dropped = decision {
+            Issue.record("malformed contains filter should not drop")
+        }
+    }
+
+    @Test func malformedNotInFilterFailsOpen() {
+        let decision = resolveSdkCollection(
+            config: SdkCollectionConfig(
+                enabled: true,
+                blockedProperties: [],
+                rules: [
+                    SdkEventRuleConfig(
+                        eventName: "purchase",
+                        action: .transform,
+                        clientIds: [],
+                        enabled: true,
+                        allowedProperties: [],
+                        blockedProperties: [],
+                        filters: [
+                            SdkEventFilter(
+                                type: "event_property",
+                                operator: "not_in",
+                                value: .string("not-an-array"),
+                                propertyName: "tier"
+                            )
+                        ]
+                    )
+                ],
+                events: nil
+            ),
+            eventName: "purchase",
+            clientId: "11111111-1111-4111-8111-111111111111",
+            properties: ["tier": "gold"],
+            context: RemoteConfigContext()
+        )
+
+        if case .dropped = decision {
+            Issue.record("malformed not_in filter should not drop")
+        }
     }
 }
 
@@ -426,4 +751,17 @@ private func makeUserDefaults() -> UserDefaults {
     let defaults = UserDefaults(suiteName: suite)!
     defaults.removePersistentDomain(forName: suite)
     return defaults
+}
+
+private func waitUntil(
+    timeoutNanoseconds: UInt64 = 2_000_000_000,
+    condition: @escaping @Sendable () -> Bool
+) async {
+    let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
+    while DispatchTime.now().uptimeNanoseconds < deadline {
+        if condition() {
+            return
+        }
+        try? await Task.sleep(nanoseconds: 25_000_000)
+    }
 }

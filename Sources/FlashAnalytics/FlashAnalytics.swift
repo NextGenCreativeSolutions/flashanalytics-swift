@@ -13,7 +13,7 @@ public final class FlashAnalytics: @unchecked Sendable {
     private let userDefaults: UserDefaults
     private let stateLock = NSLock()
 
-    private static let sessionTimeoutSeconds: TimeInterval = 30 * 60
+    private var sessionTimeoutSeconds: TimeInterval = 30 * 60
 
     private var sessionIdKey: String { "flashanalytics.session_id.\(options.appId)" }
     private var sessionIdTimestampKey: String { "flashanalytics.session_id_ts.\(options.appId)" }
@@ -34,8 +34,15 @@ public final class FlashAnalytics: @unchecked Sendable {
     private var observers: [NSObjectProtocol] = []
     private var batchQueue: [BatchQueueItem] = []
     private var batchFlushTask: Task<Void, Never>?
+    private var batchFlushGeneration = 0
     private var hasTrackedSessionInit = false
     private var sessionInitTask: Task<Void, Never>?
+    private var sdkCollectionConfig: SdkCollectionConfig?
+    private var sdkConfigSettled = false
+    private var sdkConfigExpiresAtMs: Int = 0
+    private var sdkConfigRefreshInFlight = false
+    private var sessionHeartbeatTask: Task<Void, Never>?
+    private var sessionHeartbeatActive = false
 
     @MainActor public static func configureShared(
         options: FlashAnalyticsOptions,
@@ -66,6 +73,9 @@ public final class FlashAnalytics: @unchecked Sendable {
         self.options = options
         self.userDefaults = userDefaults
         self._deferUntilIdentifyEnabled = options.deferUntilIdentify
+        if let timeout = sdkSessionTimeoutInMin(options.maxSessionTimeoutInMin) {
+            self.sessionTimeoutSeconds = TimeInterval(timeout * 60)
+        }
 
         let endpoint = URL(string: options.endpoint) ?? URL(string: "https://api.flashanalytics.app")!
         var headers = [
@@ -90,8 +100,14 @@ public final class FlashAnalytics: @unchecked Sendable {
 
         restorePendingRevenues()
         restorePersistedSessionId()
+        restorePersistedSdkConfig()
         setGlobalProperties(defaultProperties())
         loadPersistedBatchQueue()
+        if options.collectionConfig {
+            Task { [weak self] in
+                await self?.refreshSdkConfig()
+            }
+        }
         trackSessionInitialized()
         registerAutoCaptureIfNeeded()
 
@@ -115,6 +131,7 @@ public final class FlashAnalytics: @unchecked Sendable {
     }
 
     deinit {
+        stopSessionHeartbeat()
         observers.forEach(NotificationCenter.default.removeObserver)
     }
 
@@ -151,8 +168,11 @@ public final class FlashAnalytics: @unchecked Sendable {
         getSession()?.id
     }
 
-    private func onSessionId(_ id: String, estimatedExpiresAtMs: Int? = nil) {
-        let expiresAt = normalizeSessionExpiryFromResponse(estimatedExpiresAtMs)
+    private func onSessionId(_ id: String, estimatedTtlMs: Int? = nil, estimatedExpiresAtMs: Int? = nil) {
+        let expiresAt = normalizeSessionExpiryFromResponse(
+            estimatedTtlMs: estimatedTtlMs,
+            estimatedExpiresAtMs: estimatedExpiresAtMs
+        )
         let shouldRefresh = stateLock.withLock { () -> Bool in
             let changed = lastAutoSessionKey != id
             _sessionId = id
@@ -332,6 +352,9 @@ public final class FlashAnalytics: @unchecked Sendable {
 
         log("track", name, normalized)
         send(.track(payload))
+        if name != "sdk_heartbeat" {
+            scheduleSessionHeartbeat()
+        }
     }
 
     @discardableResult
@@ -345,7 +368,10 @@ public final class FlashAnalytics: @unchecked Sendable {
             properties: mergedProperties(with: [:]),
             profileId: profileId
         )
-        if let shouldTrack = options.shouldTrack, !shouldTrack(.track(payload)) {
+        guard let payloadToSend = applyCollectionRules(.track(payload)) else {
+            return nil
+        }
+        if let shouldTrack = options.shouldTrack, !shouldTrack(payloadToSend) {
             return nil
         }
 
@@ -369,7 +395,7 @@ public final class FlashAnalytics: @unchecked Sendable {
             }
             let task = Task { [weak self] in
                 guard let self else { return }
-                _ = await self.dispatch(.track(payload))
+                _ = await self.dispatch(payloadToSend)
                 self.stateLock.withLock {
                     self.sessionInitTask = nil
                 }
@@ -382,7 +408,7 @@ public final class FlashAnalytics: @unchecked Sendable {
         case .existing(let task):
             return task
         case .deferred:
-            send(.track(payload))
+            send(payloadToSend)
             return nil
         case .skipped:
             return nil
@@ -700,6 +726,62 @@ public final class FlashAnalytics: @unchecked Sendable {
         }
     }
 
+    public func refreshSdkConfig() async {
+        let shouldRefresh = stateLock.withLock { () -> Bool in
+            if sdkConfigRefreshInFlight {
+                return false
+            }
+            sdkConfigRefreshInFlight = true
+            return true
+        }
+        guard shouldRefresh else { return }
+        defer {
+            stateLock.withLock {
+                sdkConfigRefreshInFlight = false
+            }
+        }
+
+        let context = autoRemoteConfigContext()
+        guard let data = await api.send(
+            path: "/sdk-config",
+            method: "GET",
+            queryItems: context.queryItems
+        ) else {
+            stateLock.withLock {
+                sdkConfigExpiresAtMs = currentTimeMillis() + sdkConfigRetryMs
+                sdkConfigSettled = true
+            }
+            return
+        }
+
+        guard let response = try? JSONDecoder().decode(SdkConfigResponse.self, from: data) else {
+            stateLock.withLock {
+                sdkConfigExpiresAtMs = currentTimeMillis() + sdkConfigRetryMs
+                sdkConfigSettled = true
+            }
+            return
+        }
+
+        let shouldRescheduleHeartbeat = stateLock.withLock { () -> Bool in
+            let previousSessionTimeoutSeconds = sessionTimeoutSeconds
+            if let collection = response.collection {
+                sdkCollectionConfig = collection
+            }
+            if let maxSessionTimeoutInMin = response.maxSessionTimeoutInMin,
+               maxSessionTimeoutInMin > 0,
+               sdkSessionTimeoutInMin(options.maxSessionTimeoutInMin) == nil {
+                sessionTimeoutSeconds = TimeInterval(maxSessionTimeoutInMin * 60)
+            }
+            sdkConfigExpiresAtMs = currentTimeMillis() + max(1, response.ttlSec ?? 300) * 1000
+            sdkConfigSettled = true
+            return sessionHeartbeatActive && sessionTimeoutSeconds != previousSessionTimeoutSeconds
+        }
+        if shouldRescheduleHeartbeat {
+            scheduleSessionHeartbeat()
+        }
+        persistSdkConfigSnapshot()
+    }
+
     public func setSessionProperties(_ properties: [String: Any]) {
         stateLock.withLock {
             sessionProperties = JSONValue.normalize(dictionary: properties)
@@ -902,6 +984,7 @@ public final class FlashAnalytics: @unchecked Sendable {
                     queue: .main
                 ) { [weak self] _ in
                     guard let self else { return }
+                    self.startSessionHeartbeat()
                     self.setGlobalProperties(self.defaultProperties())
                     let isFirst = self.stateLock.withLock {
                         guard !self._hasTrackedInitialOpen else { return false }
@@ -922,6 +1005,7 @@ public final class FlashAnalytics: @unchecked Sendable {
                     object: nil,
                     queue: .main
                 ) { [weak self] _ in
+                    self?.stopSessionHeartbeat()
                     self?.track("app_backgrounded")
                     if self?.options.batchEnable == true {
                         Task { [weak self] in await self?.flushBatch() }
@@ -939,9 +1023,44 @@ public final class FlashAnalytics: @unchecked Sendable {
                     object: nil,
                     queue: .main
                 ) { [weak self] _ in
+                    self?.stopSessionHeartbeat()
                     self?.track("app_closed")
                 }
             )
+        }
+
+        if !options.captureAppLifecycle {
+            observers.append(
+                NotificationCenter.default.addObserver(
+                    forName: UIApplication.didBecomeActiveNotification,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.startSessionHeartbeat()
+                }
+            )
+            observers.append(
+                NotificationCenter.default.addObserver(
+                    forName: UIApplication.didEnterBackgroundNotification,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.stopSessionHeartbeat()
+                }
+            )
+            observers.append(
+                NotificationCenter.default.addObserver(
+                    forName: UIApplication.willTerminateNotification,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.stopSessionHeartbeat()
+                }
+            )
+        }
+
+        if UIApplication.shared.applicationState == .active {
+            startSessionHeartbeat()
         }
 
         if options.captureScreenViews {
@@ -1023,7 +1142,7 @@ public final class FlashAnalytics: @unchecked Sendable {
 
     // Pure serialization of a pre-stamped payload to the /track/batch envelope format.
     private func serializeToBatchItem(_ item: BatchQueueItem) -> [String: Any] {
-        item.envelope
+        applySdkEnvelopeConfig(item.envelope, payload: item.payload)
     }
 
     private func enqueueBatch(_ payload: TrackHandlerPayload) {
@@ -1036,6 +1155,7 @@ public final class FlashAnalytics: @unchecked Sendable {
         persistBatchQueue()
         if shouldFlushNow {
             stateLock.withLock {
+                batchFlushGeneration += 1
                 batchFlushTask?.cancel()
                 batchFlushTask = nil
             }
@@ -1052,26 +1172,49 @@ public final class FlashAnalytics: @unchecked Sendable {
         }
         guard !alreadyScheduled else { return }
 
-        let task = Task { [weak self] in
+        let generation = stateLock.withLock { () -> Int? in
+            if batchFlushTask == nil || batchFlushTask!.isCancelled {
+                batchFlushGeneration += 1
+                return batchFlushGeneration
+            }
+            return nil
+        }
+        guard let generation else { return }
+
+        let task = Task { [weak self, generation] in
             guard let self else { return }
             try? await Task.sleep(nanoseconds: options.batchTimeoutMs * 1_000_000)
             guard !Task.isCancelled else { return }
-            await self.flushBatch()
+            let shouldFlush = stateLock.withLock {
+                batchFlushGeneration == generation
+            }
+            guard shouldFlush else { return }
+            await self.flushBatch(cancelScheduledTask: false)
         }
 
-        stateLock.withLock {
-            if batchFlushTask == nil || batchFlushTask!.isCancelled {
-                batchFlushTask = task
-            } else {
-                task.cancel()
+        let installed = stateLock.withLock { () -> Bool in
+            guard batchFlushGeneration == generation, batchFlushTask == nil || batchFlushTask!.isCancelled else {
+                return false
             }
+            batchFlushTask = task
+            return true
+        }
+        if !installed {
+            task.cancel()
         }
     }
 
     /// Flush any buffered batch events immediately. Awaitable from async contexts.
     public func flushBatch() async {
+        await flushBatch(cancelScheduledTask: true)
+    }
+
+    private func flushBatch(cancelScheduledTask: Bool) async {
         stateLock.withLock {
-            batchFlushTask?.cancel()
+            if cancelScheduledTask {
+                batchFlushGeneration += 1
+                batchFlushTask?.cancel()
+            }
             batchFlushTask = nil
         }
         while true {
@@ -1090,8 +1233,16 @@ public final class FlashAnalytics: @unchecked Sendable {
                let response = try? JSONDecoder().decode(TrackBatchResponse.self, from: data) {
                 let sessionId = response.sessionId
                     ?? response.results?.compactMap { $0.sessionId }.first
+                let estimatedTtlMs = response.estimatedSessionTtlMs
+                    ?? response.results?.compactMap { $0.estimatedSessionTtlMs }.first
+                let estimatedExpiresAtMs = response.estimatedSessionExpiresAt
+                    ?? response.results?.compactMap { $0.estimatedSessionExpiresAt }.first
                 if let sessionId {
-                    onSessionId(sessionId, estimatedExpiresAtMs: response.estimatedSessionExpiresAt)
+                    onSessionId(
+                        sessionId,
+                        estimatedTtlMs: estimatedTtlMs,
+                        estimatedExpiresAtMs: estimatedExpiresAtMs
+                    )
                 }
             } else {
                 // /track/batch failed after retries — fall back to individual /track requests
@@ -1120,32 +1271,167 @@ public final class FlashAnalytics: @unchecked Sendable {
     private func send(_ payload: TrackHandlerPayload) {
         guard options.enabled else { return }
 
-        if let shouldTrack = options.shouldTrack, !shouldTrack(payload) {
-            log("filtered by shouldTrack", payload.type)
+        guard let payloadToSend = applyCollectionRules(payload) else {
+            return
+        }
+
+        if !isSessionHeartbeatPayload(payloadToSend),
+           let shouldTrack = options.shouldTrack,
+           !shouldTrack(payloadToSend) {
+            log("filtered by shouldTrack", payloadToSend.type)
             return
         }
 
         let shouldDefer = stateLock.withLock { _deferUntilIdentifyEnabled && _profileId == nil }
         if shouldDefer {
             stateLock.withLock {
-                deferredQueue.append(payload)
+                deferredQueue.append(payloadToSend)
             }
-            log("queued", payload.type)
+            log("queued", payloadToSend.type)
             return
         }
 
         if options.batchEnable {
-            enqueueBatch(payload)
+            enqueueBatch(payloadToSend)
         } else {
             Task {
-                _ = await self.dispatch(payload)
+                _ = await self.dispatch(payloadToSend)
             }
         }
     }
 
+    private func applyCollectionRules(_ payload: TrackHandlerPayload) -> TrackHandlerPayload? {
+        guard case let .track(trackPayload) = payload else {
+            return payload
+        }
+
+        let localDecision = resolveLocalSdkCollection(
+            allowEvents: options.allowEvents,
+            blockEvents: options.blockEvents,
+            blockProperties: options.blockProperties,
+            eventName: trackPayload.name,
+            properties: trackPayload.properties ?? [:]
+        )
+
+        let localPayload: TrackPayload
+        switch localDecision {
+        case let .allowed(properties):
+            localPayload = TrackPayload(
+                name: trackPayload.name,
+                properties: properties,
+                profileId: trackPayload.profileId
+            )
+        case let .dropped(reason):
+            log("event dropped by SDK collection rules", trackPayload.name, reason)
+            return nil
+        }
+
+        if options.collectionConfig,
+           stateLock.withLock({ sdkConfigSettled && sdkConfigExpiresAtMs > 0 && currentTimeMillis() >= sdkConfigExpiresAtMs }) {
+            Task { [weak self] in
+                await self?.refreshSdkConfig()
+            }
+        }
+
+        let config = stateLock.withLock { sdkCollectionConfig }
+        let decision = resolveSdkCollection(
+            config: config,
+            eventName: localPayload.name,
+            clientId: options.appId,
+            properties: localPayload.properties ?? [:],
+            context: autoRemoteConfigContext()
+        )
+
+        switch decision {
+        case let .allowed(properties):
+            return .track(TrackPayload(
+                name: localPayload.name,
+                properties: properties,
+                profileId: localPayload.profileId
+            ))
+        case let .dropped(reason):
+            log("event dropped by collection rules", localPayload.name, reason)
+            return nil
+        }
+    }
+
+    public func startSessionHeartbeat() {
+        stateLock.withLock {
+            sessionHeartbeatActive = true
+        }
+        scheduleSessionHeartbeat()
+    }
+
+    public func stopSessionHeartbeat() {
+        let task = stateLock.withLock { () -> Task<Void, Never>? in
+            sessionHeartbeatActive = false
+            let task = sessionHeartbeatTask
+            sessionHeartbeatTask = nil
+            return task
+        }
+        task?.cancel()
+    }
+
+    private func scheduleSessionHeartbeat() {
+        let interval = heartbeatIntervalSeconds()
+        let task = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.sendSessionHeartbeat()
+        }
+
+        let previous = stateLock.withLock { () -> Task<Void, Never>? in
+            guard sessionHeartbeatActive, options.enabled else {
+                task.cancel()
+                return nil
+            }
+            let previous = sessionHeartbeatTask
+            sessionHeartbeatTask = task
+            return previous
+        }
+        previous?.cancel()
+    }
+
+    private func sendSessionHeartbeat() {
+        guard stateLock.withLock({ sessionHeartbeatActive }) else { return }
+        sendDirect(.track(TrackPayload(
+            name: "sdk_heartbeat",
+            properties: mergedProperties(with: ["__heartbeat": true]),
+            profileId: profileId
+        )))
+        scheduleSessionHeartbeat()
+    }
+
+    private func isSessionHeartbeatPayload(_ payload: TrackHandlerPayload) -> Bool {
+        if case let .track(trackPayload) = payload {
+            return trackPayload.name == "sdk_heartbeat"
+        }
+        return false
+    }
+
+    private func sendDirect(_ payload: TrackHandlerPayload) {
+        guard options.enabled else { return }
+        guard let payloadToSend = applyCollectionRules(payload) else { return }
+        let isHeartbeat = isSessionHeartbeatPayload(payloadToSend)
+        if !isHeartbeat, let shouldTrack = options.shouldTrack, !shouldTrack(payloadToSend) {
+            log("filtered by shouldTrack", payloadToSend.type)
+            return
+        }
+        Task {
+            _ = await self.dispatch(payloadToSend)
+        }
+    }
+
+    private func heartbeatIntervalSeconds() -> TimeInterval {
+        let timeout = currentSessionTimeoutSeconds()
+        return max(5, min(timeout * 0.8, max(5, timeout - 5)))
+    }
+
     private func dispatch(_ payload: TrackHandlerPayload, timestamp: String? = nil) async -> Bool {
         let url = api.url(for: "/track")
-        if let shouldCaptureRequest = options.shouldCaptureRequest, !shouldCaptureRequest(url, payload) {
+        if !isSessionHeartbeatPayload(payload),
+           let shouldCaptureRequest = options.shouldCaptureRequest,
+           !shouldCaptureRequest(url, payload) {
             log("filtered by shouldCaptureRequest", url.absoluteString)
             return true
         }
@@ -1154,21 +1440,46 @@ public final class FlashAnalytics: @unchecked Sendable {
         if let timestamp {
             envelope["__timestamp"] = timestamp
         }
+        envelope = applySdkEnvelopeConfig(envelope, payload: payload)
 
         if let data = await api.send(path: "/track", body: envelope),
            let response = try? JSONDecoder().decode(TrackResponse.self, from: data) {
             if let id = response.sessionId {
-                onSessionId(id, estimatedExpiresAtMs: response.estimatedSessionExpiresAt)
+                onSessionId(
+                    id,
+                    estimatedTtlMs: response.estimatedSessionTtlMs,
+                    estimatedExpiresAtMs: response.estimatedSessionExpiresAt
+                )
             }
             return true
         }
         return false
     }
 
-    private func normalizeSessionExpiryFromResponse(_ expiresAtMs: Int?) -> TimeInterval {
+    private func applySdkEnvelopeConfig(
+        _ envelope: [String: Any],
+        payload: TrackHandlerPayload
+    ) -> [String: Any] {
+        guard case .track = payload,
+              let timeout = sdkSessionTimeoutInMin(options.maxSessionTimeoutInMin) else {
+            return envelope
+        }
+        var next = envelope
+        next["__maxSessionTimeoutInMin"] = timeout
+        return next
+    }
+
+    private func normalizeSessionExpiryFromResponse(
+        estimatedTtlMs: Int? = nil,
+        estimatedExpiresAtMs expiresAtMs: Int? = nil
+    ) -> TimeInterval {
         let now = Date().timeIntervalSince1970
+        if let estimatedTtlMs, estimatedTtlMs > 0 {
+            return now + (TimeInterval(estimatedTtlMs) / 1000)
+        }
+
         guard let expiresAtMs, expiresAtMs > 0 else {
-            return now + Self.sessionTimeoutSeconds
+            return now + currentSessionTimeoutSeconds()
         }
 
         let expiresAtSeconds = TimeInterval(expiresAtMs) / 1000
@@ -1176,13 +1487,13 @@ public final class FlashAnalytics: @unchecked Sendable {
             return expiresAtSeconds
         }
 
-        return now + Self.sessionTimeoutSeconds
+        return now + currentSessionTimeoutSeconds()
     }
 
     private func normalizeRestoredSessionExpiresAt(_ expiresAtMs: Int?) -> TimeInterval {
         let now = Date().timeIntervalSince1970
         guard let expiresAtMs, expiresAtMs > 0 else {
-            return now + Self.sessionTimeoutSeconds
+            return now + currentSessionTimeoutSeconds()
         }
 
         let expiresAtSeconds = TimeInterval(expiresAtMs) / 1000
@@ -1190,7 +1501,11 @@ public final class FlashAnalytics: @unchecked Sendable {
             return expiresAtSeconds
         }
 
-        return expiresAtSeconds + Self.sessionTimeoutSeconds
+        return expiresAtSeconds + currentSessionTimeoutSeconds()
+    }
+
+    private func currentSessionTimeoutSeconds() -> TimeInterval {
+        stateLock.withLock { sessionTimeoutSeconds }
     }
 
     private func flushDeferredQueue() async {
@@ -1202,10 +1517,11 @@ public final class FlashAnalytics: @unchecked Sendable {
 
         for payload in queued {
             let backfilled = payload.backfilled(profileId: profileId)
+            guard let payloadToSend = applyCollectionRules(backfilled) else { continue }
             if options.batchEnable {
-                enqueueBatch(backfilled)
+                enqueueBatch(payloadToSend)
             } else {
-                _ = await dispatch(backfilled)
+                _ = await dispatch(payloadToSend)
             }
         }
         if options.batchEnable && !queued.isEmpty {
@@ -1274,6 +1590,46 @@ public final class FlashAnalytics: @unchecked Sendable {
         if let data = try? JSONEncoder().encode(encoded) {
             userDefaults.set(data, forKey: StorageKey.pendingRevenues)
         }
+    }
+
+    private func restorePersistedSdkConfig() {
+        guard options.collectionConfig,
+              let data = userDefaults.data(forKey: sdkConfigStorageKey),
+              let snapshot = try? JSONDecoder().decode(PersistedSdkConfigSnapshot.self, from: data) else {
+            return
+        }
+
+        let shouldRescheduleHeartbeat = stateLock.withLock { () -> Bool in
+            let previousSessionTimeoutSeconds = sessionTimeoutSeconds
+            sdkCollectionConfig = snapshot.collection
+            if let maxSessionTimeoutInMin = snapshot.maxSessionTimeoutInMin,
+               maxSessionTimeoutInMin > 0,
+               sdkSessionTimeoutInMin(options.maxSessionTimeoutInMin) == nil {
+                sessionTimeoutSeconds = TimeInterval(maxSessionTimeoutInMin * 60)
+            }
+            sdkConfigExpiresAtMs = snapshot.expiresAtMs
+            sdkConfigSettled = true
+            return sessionHeartbeatActive && sessionTimeoutSeconds != previousSessionTimeoutSeconds
+        }
+        if shouldRescheduleHeartbeat {
+            scheduleSessionHeartbeat()
+        }
+    }
+
+    private func persistSdkConfigSnapshot() {
+        let snapshot = stateLock.withLock {
+            PersistedSdkConfigSnapshot(
+                collection: sdkCollectionConfig,
+                maxSessionTimeoutInMin: Int(sessionTimeoutSeconds / 60),
+                expiresAtMs: sdkConfigExpiresAtMs
+            )
+        }
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        userDefaults.set(data, forKey: sdkConfigStorageKey)
+    }
+
+    private var sdkConfigStorageKey: String {
+        "\(StorageKey.sdkConfig).\(options.appId)"
     }
 
     private func defaultProperties() -> [String: Any] {
@@ -1485,8 +1841,26 @@ private extension AssignmentMode {
 private struct StorageKey {
     static let deviceId = "flashanalytics.device_id"
     static let pendingRevenues = "flashanalytics.pending_revenues"
+    static let sdkConfig = "flashanalytics.sdk_config"
     static let lastBuildNumber = "flashanalytics.last_build_number"
     static let installAttributionProcessedBuild = "flashanalytics.install_attribution_processed_build"
+}
+
+private func currentTimeMillis() -> Int {
+    Int(Date().timeIntervalSince1970 * 1000)
+}
+
+private func sdkSessionTimeoutInMin(_ value: Int?) -> Int? {
+    guard let value else { return nil }
+    return max(1, min(24 * 60, value))
+}
+
+private let sdkConfigRetryMs = 30_000
+
+private struct PersistedSdkConfigSnapshot: Codable {
+    let collection: SdkCollectionConfig?
+    let maxSessionTimeoutInMin: Int?
+    let expiresAtMs: Int
 }
 
 private struct PendingRevenueEntry {
